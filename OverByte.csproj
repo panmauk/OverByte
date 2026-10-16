@@ -14,7 +14,18 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- The Linux (Avalonia) port lives in .\linux and must not be globbed into this project. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);linux\**</DefaultItemExcludes>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Form1.cs" />
+    <Compile Include="Form1.Designer.cs" />
+    <Compile Include="Program.cs" />
+    <!-- Shared, UI-free inflation core (also compiled by linux\OverByte.Linux.csproj) -->
+    <Compile Include="Core\*.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <Content Include="app.ico">

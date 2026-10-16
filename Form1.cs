@@ -22,6 +22,15 @@ public partial class Form1 : Form
     static readonly Color AccentRed = Color.FromArgb(230, 60, 60);
     static readonly Color HeaderBg = Color.FromArgb(20, 24, 30);
 
+    // ── Cached fonts (creating Font objects inside Paint handlers leaks GDI handles) ──
+    static readonly Font FontLogo = new("Segoe UI", 16f, FontStyle.Bold);
+    static readonly Font FontVersion = new("Segoe UI", 7.5f);
+    static readonly Font FontCardIcon = new("Segoe UI", 22f, FontStyle.Bold);
+    static readonly Font FontCardTitle = new("Segoe UI Semibold", 14f);
+    static readonly Font FontCardDesc = new("Segoe UI", 9f);
+    static readonly Font FontPillLabel = new("Segoe UI Semibold", 7.5f);
+    static readonly Font FontPillValue = new("Segoe UI Semibold", 8.5f);
+
     // ── Screens ──
     Panel headerPanel = null!;
     Panel menuScreen = null!;
@@ -69,18 +78,21 @@ public partial class Form1 : Form
     Panel folderProgressTrack = null!;
     Panel folderProgressFill = null!;
 
-    long _originalSize;
+    long _fileOriginalSize;     // size of the file loaded on the FILE screen
+    long _folderOriginalSize;   // total size of the folder loaded on the FOLDER screen
     CancellationTokenSource? _cts;
     bool _inflating;
+    bool _closeRequested;
     Task? _inflateTask;
-    readonly List<string> _activeOutputFiles = new();
+    OBButton? _btnBack;
+    readonly ToolTip _historyTip = new();
 
     // ── History ──
     Panel historyPanel = null!;
-    static readonly string HistoryFile = Path.Combine(
+    static readonly HistoryStore History = new(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "OverByte", "history.txt");
-    const int MaxHistory = 5;
+        "OverByte", "history.txt"));
+    const int MaxHistory = HistoryStore.MaxHistory;
 
     public Form1()
     {
@@ -100,26 +112,35 @@ public partial class Form1 : Form
                 "Close anyway?",
                 "OverByte — Still Working",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-            if (r != DialogResult.Yes)
+            // Never block the UI thread waiting for the worker (the folder-mode tasks resume on the
+            // UI thread, so a blocking wait here deadlocks). Cancel, keep the window open and let the
+            // inflate handler close the form once it has cleaned up its partial output.
+            e.Cancel = true;
+            if (r == DialogResult.Yes)
             {
-                e.Cancel = true;
-                return;
+                _closeRequested = true;
+                _cts?.Cancel();
             }
-            // Cancel the operation and wait for file handles to be released
-            _cts?.Cancel();
-            try { _inflateTask?.GetAwaiter().GetResult(); } catch { /* swallow cancel/errors */ }
-            // Delete partial output files
-            foreach (var f in _activeOutputFiles)
-            {
-                try
-                {
-                    if (File.Exists(f)) File.Delete(f);
-                    else if (Directory.Exists(f)) Directory.Delete(f, recursive: true);
-                }
-                catch { /* best effort */ }
-            }
+            return;
         }
         base.OnFormClosing(e);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _historyTip.Dispose();
+        base.OnFormClosed(e);
+    }
+
+    /// Called from the inflate handlers' finally blocks: finishes a close the user confirmed mid-operation.
+    void FinishOperation()
+    {
+        _cts?.Dispose();
+        _cts = null;
+        _inflating = false;
+        _inflateTask = null;
+        if (_btnBack != null) _btnBack.Enabled = true;
+        if (_closeRequested) { _closeRequested = false; Close(); }
     }
 
     void BuildUI()
@@ -138,12 +159,8 @@ public partial class Form1 : Form
         BuildFileScreen();
         BuildFolderScreen();
 
-        // Enable drag-drop on all screens
-        EnablePanelDragDrop(menuScreen);
-        EnablePanelDragDrop(fileScreen);
-        EnablePanelDragDrop(folderScreen);
-        EnablePanelDragDrop(folderModePanel);
-        EnablePanelDragDrop(folderWorkPanel);
+        // Enable drag-drop on every control of every screen ("drag & drop anywhere")
+        EnableDragDropRecursive(this);
 
         ShowScreen("menu");
     }
@@ -155,30 +172,30 @@ public partial class Form1 : Form
     void BuildHeader()
     {
         headerPanel = new Panel { Dock = DockStyle.Top, Height = 56, BackColor = HeaderBg };
-        OBButton? btnBack = null;
-        btnBack = new OBButton("<  BACK", 820, 12, 80, 32);
+        var btnBack = new OBButton("<  BACK", 820, 12, 80, 32);
         btnBack.Visible = false;
         btnBack.Click += (s, e) =>
         {
+            if (_inflating) return;
             ShowScreen("menu");
-            btnBack.Visible = false;
         };
         headerPanel.Controls.Add(btnBack);
         headerPanel.Tag = btnBack; // store ref
+        _btnBack = btnBack;
 
         headerPanel.Paint += (s, e) =>
         {
             var g = e.Graphics;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            TextRenderer.DrawText(g, "Over", new Font("Segoe UI", 16f, FontStyle.Bold), new Point(28, 12), Color.White);
-            var overW = TextRenderer.MeasureText("Over", new Font("Segoe UI", 16f, FontStyle.Bold)).Width - 10;
-            TextRenderer.DrawText(g, "Byte", new Font("Segoe UI", 16f, FontStyle.Bold), new Point(28 + overW, 12), GreenPrimary);
+            TextRenderer.DrawText(g, "Over", FontLogo, new Point(28, 12), Color.White);
+            var overW = TextRenderer.MeasureText("Over", FontLogo).Width - 10;
+            TextRenderer.DrawText(g, "Byte", FontLogo, new Point(28 + overW, 12), GreenPrimary);
             var vRect = new Rectangle(740, 18, 50, 20);
             using var pillBrush = new SolidBrush(Color.FromArgb(40, 44, 52));
             using var pillPath = RoundRect(vRect, 10);
             g.FillPath(pillBrush, pillPath);
-            TextRenderer.DrawText(g, "v1.0", new Font("Segoe UI", 7.5f), vRect, Color.FromArgb(120, 125, 135),
+            TextRenderer.DrawText(g, "v1.0", FontVersion, vRect, Color.FromArgb(120, 125, 135),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         };
         Controls.Add(headerPanel);
@@ -212,10 +229,10 @@ public partial class Form1 : Form
             ForeColor = TextDark,
             AutoSize = true,
             BackColor = BgWhite,
-            Location = new Point(0, 80)
+            Location = new Point(0, 36)
         };
         // Center it
-        lblChoose.Location = new Point((960 - TextRenderer.MeasureText(lblChoose.Text, lblChoose.Font).Width) / 2, 80);
+        lblChoose.Location = new Point((960 - TextRenderer.MeasureText(lblChoose.Text, lblChoose.Font).Width) / 2, 36);
         menuScreen.Controls.Add(lblChoose);
 
         var lblSub = new Label
@@ -226,35 +243,28 @@ public partial class Form1 : Form
             AutoSize = true,
             BackColor = BgWhite
         };
-        lblSub.Location = new Point((960 - TextRenderer.MeasureText(lblSub.Text, lblSub.Font).Width) / 2, 120);
+        lblSub.Location = new Point((960 - TextRenderer.MeasureText(lblSub.Text, lblSub.Font).Width) / 2, 76);
         menuScreen.Controls.Add(lblSub);
 
         // Two big cards side by side
-        var fileCard = MakeMenuCard(140, 190, 300, 260,
+        var fileCard = MakeMenuCard(140, 116, 300, 260,
             "FILE", "Inflate a single file to\nany target size. Works with\nJPG, PNG, MP4, PDF, ISO,\nand almost any format.",
             "file_icon");
         fileCard.Click += (s, e) => ShowScreen("file");
         fileCard.Cursor = Cursors.Hand;
         menuScreen.Controls.Add(fileCard);
 
-        var folderCard = MakeMenuCard(520, 190, 300, 260,
+        var folderCard = MakeMenuCard(520, 116, 300, 260,
             "FOLDER", "Inflate an entire folder.\nCompress & enlarge into\na big ZIP, or inflate every\nfile individually.",
             "folder_icon");
-        folderCard.Click += (s, e) =>
-        {
-            _folderMode = FolderMode.None;
-            folderModePanel.Visible = true;
-            folderWorkPanel.Visible = false;
-            folderStatsPanel.Visible = false;
-            ShowScreen("folder");
-        };
+        folderCard.Click += (s, e) => OpenFolderScreen(null);
         folderCard.Cursor = Cursors.Hand;
         menuScreen.Controls.Add(folderCard);
 
         // History panel
         historyPanel = new Panel
         {
-            Location = new Point(140, 470),
+            Location = new Point(140, 420),
             Size = new Size(680, 150),
             BackColor = BgWhite,
             Visible = false
@@ -272,30 +282,27 @@ public partial class Form1 : Form
             BackColor = BgWhite,
             UseMnemonic = false
         };
-        lblDrag.Location = new Point((960 - TextRenderer.MeasureText(lblDrag.Text, lblDrag.Font).Width) / 2, 480);
+        lblDrag.Location = new Point((960 - TextRenderer.MeasureText(lblDrag.Text, lblDrag.Font).Width) / 2, 388);
         menuScreen.Controls.Add(lblDrag);
-
-        // Drag-drop everywhere
-        AllowDrop = true;
-        DragEnter += HandleDragEnter;
-        DragDrop += HandleDragDrop;
     }
 
-    void EnablePanelDragDrop(Panel panel)
+    void EnableDragDropRecursive(Control c)
     {
-        panel.AllowDrop = true;
-        panel.DragEnter += HandleDragEnter;
-        panel.DragDrop += HandleDragDrop;
+        c.AllowDrop = true;
+        c.DragEnter += HandleDragEnter;
+        c.DragDrop += HandleDragDrop;
+        foreach (Control child in c.Controls) EnableDragDropRecursive(child);
     }
 
     void HandleDragEnter(object? s, DragEventArgs e)
     {
-        if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
+        if (!_inflating && e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
             e.Effect = DragDropEffects.Copy;
     }
 
     void HandleDragDrop(object? s, DragEventArgs e)
     {
+        if (_inflating) return;
         var paths = e.Data?.GetData(DataFormats.FileDrop) as string[];
         if (paths?.Length > 0)
         {
@@ -310,14 +317,9 @@ public partial class Form1 : Form
             }
             else if (isDir)
             {
-                _folderMode = FolderMode.None;
-                folderModePanel.Visible = true;
-                folderWorkPanel.Visible = false;
-                folderStatsPanel.Visible = false;
-                ShowScreen("folder");
-                LoadFolder(paths[0]);
+                OpenFolderScreen(paths[0]);
             }
-            else
+            else if (File.Exists(paths[0]))
             {
                 ShowScreen("file");
                 LoadFile(paths[0]);
@@ -353,17 +355,16 @@ public partial class Form1 : Form
             g.FillPath(iconBg, iconPath);
 
             // Icon symbol
-            var iconFont = new Font("Segoe UI", 22f, FontStyle.Bold);
             var sym = title == "FILE" ? "F" : "D";
-            TextRenderer.DrawText(g, sym, iconFont, iconRect, GreenDark,
+            TextRenderer.DrawText(g, sym, FontCardIcon, iconRect, GreenDark,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
 
             // Title
-            TextRenderer.DrawText(g, title, new Font("Segoe UI Semibold", 14f),
+            TextRenderer.DrawText(g, title, FontCardTitle,
                 new Rectangle(0, 105, w, 30), TextDark, TextFormatFlags.HorizontalCenter);
 
             // Description
-            TextRenderer.DrawText(g, desc, new Font("Segoe UI", 9f),
+            TextRenderer.DrawText(g, desc, FontCardDesc,
                 new Rectangle(24, 142, w - 48, 100), TextMid,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
         };
@@ -662,6 +663,9 @@ public partial class Form1 : Form
 
         // Update button label
         btnFolderInflate.SetLabel(_folderMode == FolderMode.CompressEnlarge ? "COMPRESS & INFLATE" : "INFLATE ALL FILES");
+
+        // A folder may already be loaded (history / drag-drop before the mode was chosen): fix the default output
+        SetFolderOutputDefault();
     }
 
     // ════════════════════════════════════════════════
@@ -701,9 +705,9 @@ public partial class Form1 : Form
         using var path = RoundRect(r, 14);
         using var brush = new SolidBrush(GreenLight);
         g.FillPath(brush, path);
-        TextRenderer.DrawText(g, label, new Font("Segoe UI Semibold", 7.5f), new Point(x + 14, y + 6), TextMid);
-        var vs = TextRenderer.MeasureText(value, new Font("Segoe UI Semibold", 8.5f));
-        TextRenderer.DrawText(g, value, new Font("Segoe UI Semibold", 8.5f), new Point(x + 196 - vs.Width, y + 5), GreenDark);
+        TextRenderer.DrawText(g, label, FontPillLabel, new Point(x + 14, y + 6), TextMid);
+        var vs = TextRenderer.MeasureText(value, FontPillValue);
+        TextRenderer.DrawText(g, value, FontPillValue, new Point(x + 196 - vs.Width, y + 5), GreenDark);
     }
 
     static GraphicsPath RoundRect(Rectangle r, int radius)
@@ -722,22 +726,41 @@ public partial class Form1 : Form
     //  FILE MODE LOGIC
     // ════════════════════════════════════════════════
 
+    void OpenFolderScreen(string? path)
+    {
+        _folderMode = FolderMode.None;
+        folderModePanel.Visible = true;
+        folderWorkPanel.Visible = false;
+        folderStatsPanel.Visible = false;
+        ShowScreen("folder");
+        if (path != null) LoadFolder(path);
+    }
+
     void LoadFile(string path)
     {
-        if (!File.Exists(path)) return;
+        if (_inflating || !File.Exists(path)) return;
+        long size;
+        try { size = new FileInfo(path).Length; }
+        catch (Exception ex)
+        {
+            lblFileStatus.Text = $"error: {ex.Message}";
+            lblFileStatus.ForeColor = AccentRed;
+            return;
+        }
         SaveToHistory(path);
         txtFilePath.Text = path;
-        _originalSize = new FileInfo(path).Length;
-        lblFileOrigSize.Text = FormatSize(_originalSize);
+        _fileOriginalSize = size;
+        lblFileOrigSize.Text = FormatSize(_fileOriginalSize);
 
         var dir = Path.GetDirectoryName(path) ?? "";
         var name = Path.GetFileNameWithoutExtension(path);
         var ext = Path.GetExtension(path);
         txtFileOutput.Text = Path.Combine(dir, name + "_inflated" + ext);
 
-        if (_originalSize < 1024 * 1024) { txtFileSize.Text = "10.00"; cmbFileUnit.SelectedIndex = 1; }
-        else if (_originalSize < 1024L * 1024 * 1024) { txtFileSize.Text = "1.00"; cmbFileUnit.SelectedIndex = 2; }
-        else { txtFileSize.Text = (Math.Ceiling((double)_originalSize / (1024.0 * 1024 * 1024)) * 2).ToString("F2"); cmbFileUnit.SelectedIndex = 2; }
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        if (_fileOriginalSize < 1024 * 1024) { txtFileSize.Text = "10.00"; cmbFileUnit.SelectedIndex = 1; }
+        else if (_fileOriginalSize < 1024L * 1024 * 1024) { txtFileSize.Text = "1.00"; cmbFileUnit.SelectedIndex = 2; }
+        else { txtFileSize.Text = (Math.Ceiling((double)_fileOriginalSize / (1024.0 * 1024 * 1024)) * 2).ToString("F2", inv); cmbFileUnit.SelectedIndex = 2; }
 
         btnFileInflate.Enabled = true;
         UpdateFileStats();
@@ -749,10 +772,10 @@ public partial class Form1 : Form
     {
         long target = GetTargetBytes(txtFileSize, cmbFileUnit);
         lblFileStatTarget!.Tag = FormatSize(target);
-        if (_originalSize > 0)
+        if (_fileOriginalSize > 0)
         {
-            lblFileStatOrig!.Tag = FormatSize(_originalSize);
-            double ratio = target > _originalSize ? (double)target / _originalSize : 0;
+            lblFileStatOrig!.Tag = FormatSize(_fileOriginalSize);
+            double ratio = target > _fileOriginalSize ? (double)target / _fileOriginalSize : 0;
             lblFileStatRatio!.Tag = ratio > 0 ? $"{ratio:F1}x" : "—";
             lblFileRatio.Text = ratio > 0 ? $"{ratio:F0}x inflation" : "";
             lblFileRatio.ForeColor = ratio > 100 ? AccentRed : GreenPrimary;
@@ -768,9 +791,20 @@ public partial class Form1 : Form
         var dst = chkFileOverwrite.Checked ? src : txtFileOutput.Text;
         if (string.IsNullOrEmpty(dst)) { ShowMsg("Select an output path."); return; }
 
+        // Re-read the real size now: the file may have changed since it was loaded
+        long srcSize;
+        try
+        {
+            if (!File.Exists(src)) { ShowMsg("The source file no longer exists."); return; }
+            srcSize = new FileInfo(src).Length;
+        }
+        catch (Exception ex) { ShowMsg($"Cannot read the source file:\n{ex.Message}"); return; }
+        _fileOriginalSize = srcSize;
+        UpdateFileStats();
+
         long target = GetTargetBytes(txtFileSize, cmbFileUnit);
-        if (target <= _originalSize) { ShowMsg($"Target must exceed original ({FormatSize(_originalSize)})."); return; }
-        long padding = target - _originalSize;
+        if (target <= srcSize) { ShowMsg($"Target must exceed original ({FormatSize(srcSize)})."); return; }
+        long padding = target - srcSize;
 
         // Warn about WIC 4GB limit for image formats
         var ext = Path.GetExtension(src).ToLowerInvariant();
@@ -789,13 +823,13 @@ public partial class Form1 : Form
             if (MessageBox.Show($"Creating {FormatSize(target)} file. Continue?", "OverByte", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
         }
 
+        // The output is staged in a temp file next to the destination, so the full target size is needed
         if (!CheckDiskSpace(dst, target)) return;
 
-        SetFileUIBusy(true);
         _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+        SetFileUIBusy(true);
         _inflating = true;
-        _activeOutputFiles.Clear();
-        _activeOutputFiles.Add(dst);
         try
         {
             var progress = new Progress<(long written, string status)>(p =>
@@ -804,26 +838,29 @@ public partial class Form1 : Form
                 lblFileStatus.Text = $"inflating... {FormatSize(p.written)} / {FormatSize(padding)}";
                 lblFileStatus.ForeColor = GreenDark;
             });
-            _inflateTask = Task.Run(() => InflateFile(src, dst, padding, progress, _cts.Token), _cts.Token);
+            _inflateTask = Task.Run(() => Inflator.InflateFile(src, dst, padding, progress, ct), ct);
             await _inflateTask;
 
             SetProgress(fileProgressFill, fileProgressTrack, 1.0);
-            lblFileStatus.Text = $"done — {FormatSize(_originalSize)} → {FormatSize(new FileInfo(dst).Length)}";
+            lblFileStatus.Text = $"done — {FormatSize(srcSize)} → {FormatSize(new FileInfo(dst).Length)}";
             lblFileStatus.ForeColor = GreenPrimary;
-            System.Media.SystemSounds.Asterisk.Play();
+            if (!_closeRequested) System.Media.SystemSounds.Asterisk.Play();
         }
         catch (OperationCanceledException) { lblFileStatus.Text = "cancelled"; lblFileStatus.ForeColor = TextLight; }
+        catch (UserMessageException ex) { lblFileStatus.Text = $"error: {ex.Message}"; lblFileStatus.ForeColor = AccentRed; ShowMsg(ex.Message); }
         catch (Exception ex) { lblFileStatus.Text = $"error: {ex.Message}"; lblFileStatus.ForeColor = AccentRed; }
-        finally { SetFileUIBusy(false); _inflating = false; _inflateTask = null; _activeOutputFiles.Clear(); }
+        finally { SetFileUIBusy(false); FinishOperation(); }
     }
 
     void SetFileUIBusy(bool busy)
     {
         btnFileBrowse.Enabled = !busy;
-        btnFileOutputBrowse.Enabled = !busy; txtFileSize.Enabled = !busy;
+        btnFileOutputBrowse.Enabled = !busy && !chkFileOverwrite.Checked;
+        txtFileSize.Enabled = !busy;
         cmbFileUnit.Enabled = !busy; chkFileOverwrite.Enabled = !busy;
         if (busy) SetProgress(fileProgressFill, fileProgressTrack, 0);
         btnFileInflate.SetLabel(busy ? "CANCEL" : "INFLATE");
+        if (_btnBack != null) _btnBack.Enabled = !busy;
         TaskbarProgress.SetState(Handle, busy);
     }
 
@@ -831,22 +868,10 @@ public partial class Form1 : Form
     //  FOLDER MODE LOGIC
     // ════════════════════════════════════════════════
 
-    void LoadFolder(string path)
+    void SetFolderOutputDefault()
     {
-        if (!Directory.Exists(path)) return;
-        SaveToHistory(path);
-        txtFolderPath.Text = path;
-
-        long total = 0;
-        int count = 0;
-        foreach (var f in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-        {
-            total += new FileInfo(f).Length;
-            count++;
-        }
-        _originalSize = total;
-        lblFolderOrigSize.Text = $"{FormatSize(total)} across {count} files";
-
+        var path = txtFolderPath.Text;
+        if (string.IsNullOrEmpty(path)) return;
         if (_folderMode == FolderMode.CompressEnlarge)
         {
             var parent = Path.GetDirectoryName(path) ?? path;
@@ -856,9 +881,36 @@ public partial class Form1 : Form
         {
             txtFolderOutput.Text = path + "_inflated";
         }
+    }
 
+    void LoadFolder(string path)
+    {
+        if (_inflating || !Directory.Exists(path)) return;
+        // Normalise "C:\dir\" -> "C:\dir" so derived output names land next to the folder, not inside it
+        if (Path.GetPathRoot(path) != path) path = Path.TrimEndingDirectorySeparator(path);
+
+        long total; int count;
+        var oldCursor = Cursor;
+        Cursor = Cursors.WaitCursor;
+        try { (total, count) = FolderInflator.Scan(path); }
+        catch (Exception ex)
+        {
+            lblFolderStatus.Text = $"error: {ex.Message}";
+            lblFolderStatus.ForeColor = AccentRed;
+            return;
+        }
+        finally { Cursor = oldCursor; }
+
+        SaveToHistory(path);
+        txtFolderPath.Text = path;
+        _folderOriginalSize = total;
+        lblFolderOrigSize.Text = $"{FormatSize(total)} across {count} files";
+
+        SetFolderOutputDefault();
+
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
         if (total < 1024L * 1024 * 1024) { txtFolderSize.Text = "1.00"; cmbFolderUnit.SelectedIndex = 2; }
-        else { txtFolderSize.Text = (Math.Ceiling((double)total / (1024.0 * 1024 * 1024)) * 2).ToString("F2"); cmbFolderUnit.SelectedIndex = 2; }
+        else { txtFolderSize.Text = (Math.Ceiling((double)total / (1024.0 * 1024 * 1024)) * 2).ToString("F2", inv); cmbFolderUnit.SelectedIndex = 2; }
 
         btnFolderInflate.Enabled = true;
         UpdateFolderStats();
@@ -870,10 +922,10 @@ public partial class Form1 : Form
     {
         long target = GetTargetBytes(txtFolderSize, cmbFolderUnit);
         lblFolderStatTarget!.Tag = FormatSize(target);
-        if (_originalSize > 0)
+        if (_folderOriginalSize > 0)
         {
-            lblFolderStatOrig!.Tag = FormatSize(_originalSize);
-            double ratio = target > _originalSize ? (double)target / _originalSize : 0;
+            lblFolderStatOrig!.Tag = FormatSize(_folderOriginalSize);
+            double ratio = target > _folderOriginalSize ? (double)target / _folderOriginalSize : 0;
             lblFolderStatRatio!.Tag = ratio > 0 ? $"{ratio:F1}x" : "—";
             lblFolderRatio.Text = ratio > 0 ? $"{ratio:F0}x" : "";
             lblFolderRatio.ForeColor = ratio > 100 ? AccentRed : GreenPrimary;
@@ -884,131 +936,52 @@ public partial class Form1 : Form
     async void BtnFolderInflate_Click(object? sender, EventArgs e)
     {
         if (_inflating) { _cts?.Cancel(); return; }
-        if (string.IsNullOrEmpty(txtFolderPath.Text)) return;
+        if (string.IsNullOrEmpty(txtFolderPath.Text) || _folderMode == FolderMode.None) return;
         var src = txtFolderPath.Text;
         var dst = txtFolderOutput.Text;
         if (string.IsNullOrEmpty(dst)) { ShowMsg("Select an output path."); return; }
+        if (!Directory.Exists(src)) { ShowMsg("The source folder no longer exists."); return; }
 
         long target = GetTargetBytes(txtFolderSize, cmbFolderUnit);
+        var mode = _folderMode;
         _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
         SetFolderUIBusy(true);
         _inflating = true;
-        _activeOutputFiles.Clear();
-        _activeOutputFiles.Add(dst);
 
         try
         {
-            if (_folderMode == FolderMode.CompressEnlarge)
+            var progress = new Progress<(double fraction, string status)>(p =>
             {
-                _inflateTask = DoCompressEnlarge(src, dst, target, _cts.Token);
+                SetProgress(folderProgressFill, folderProgressTrack, p.fraction);
+                if (p.status != "done") { lblFolderStatus.Text = p.status; lblFolderStatus.ForeColor = GreenDark; }
+            });
+
+            if (mode == FolderMode.CompressEnlarge)
+            {
+                _inflateTask = Task.Run(() => FolderInflator.CompressEnlarge(src, dst, target, progress, ct), ct);
                 await _inflateTask;
+
+                SetProgress(folderProgressFill, folderProgressTrack, 1.0);
+                var finalSize = new FileInfo(dst).Length;
+                lblFolderStatus.Text = $"done — {FormatSize(_folderOriginalSize)} folder → {FormatSize(finalSize)} ZIP";
             }
             else
             {
-                _inflateTask = DoInflateAll(src, dst, target, _cts.Token);
+                int n = 0;
+                _inflateTask = Task.Run(() => { n = FolderInflator.InflateAll(src, dst, target, progress, ct); }, ct);
                 await _inflateTask;
+
+                SetProgress(folderProgressFill, folderProgressTrack, 1.0);
+                lblFolderStatus.Text = $"done — {n} files inflated to {FormatSize(target)} each";
             }
+            lblFolderStatus.ForeColor = GreenPrimary;
+            if (!_closeRequested) System.Media.SystemSounds.Asterisk.Play();
         }
         catch (OperationCanceledException) { lblFolderStatus.Text = "cancelled"; lblFolderStatus.ForeColor = TextLight; }
+        catch (UserMessageException ex) { lblFolderStatus.Text = $"stopped: {ex.Message.Split('\n')[0]}"; lblFolderStatus.ForeColor = AccentRed; ShowMsg(ex.Message); }
         catch (Exception ex) { lblFolderStatus.Text = $"error: {ex.Message}"; lblFolderStatus.ForeColor = AccentRed; }
-        finally { SetFolderUIBusy(false); _inflating = false; _inflateTask = null; _activeOutputFiles.Clear(); }
-    }
-
-    async Task DoCompressEnlarge(string srcFolder, string outputZip, long targetBytes, CancellationToken ct)
-    {
-        if (!CheckDiskSpace(outputZip, targetBytes)) return;
-
-        lblFolderStatus.Text = "compressing folder to ZIP...";
-        lblFolderStatus.ForeColor = GreenDark;
-
-        // Step 1: Create ZIP
-        await Task.Run(() =>
-        {
-            if (File.Exists(outputZip)) File.Delete(outputZip);
-            ZipFile.CreateFromDirectory(srcFolder, outputZip, CompressionLevel.Optimal, includeBaseDirectory: false);
-        }, ct);
-
-        var zipSize = new FileInfo(outputZip).Length;
-        if (targetBytes <= zipSize)
-        {
-            ShowMsg($"Target ({FormatSize(targetBytes)}) must exceed ZIP size ({FormatSize(zipSize)}).");
-            return;
-        }
-
-        long padding = targetBytes - zipSize;
-        lblFolderStatus.Text = $"ZIP created ({FormatSize(zipSize)}) — inflating...";
-
-        // Step 2: Add invisible padding (same EOCD-relocation technique)
-        var progress = new Progress<(long written, string status)>(p =>
-        {
-            SetProgress(folderProgressFill, folderProgressTrack, (double)p.written / padding);
-            lblFolderStatus.Text = $"inflating ZIP... {FormatSize(p.written)} / {FormatSize(padding)}";
-        });
-
-        await Task.Run(() =>
-        {
-            InflateZipBased(outputZip, outputZip, padding, progress, ct);
-        }, ct);
-
-        SetProgress(folderProgressFill, folderProgressTrack, 1.0);
-        var finalSize = new FileInfo(outputZip).Length;
-        lblFolderStatus.Text = $"done — {FormatSize(_originalSize)} folder → {FormatSize(finalSize)} ZIP";
-        lblFolderStatus.ForeColor = GreenPrimary;
-        System.Media.SystemSounds.Asterisk.Play();
-    }
-
-    async Task DoInflateAll(string srcFolder, string outputFolder, long targetPerFile, CancellationToken ct)
-    {
-        var files = Directory.GetFiles(srcFolder, "*", SearchOption.AllDirectories);
-        if (files.Length == 0) { ShowMsg("Folder is empty."); return; }
-
-        long totalRequired = targetPerFile * files.Length;
-        if (!CheckDiskSpace(outputFolder, totalRequired)) return;
-
-        // Create output folder structure
-        if (!Directory.Exists(outputFolder)) Directory.CreateDirectory(outputFolder);
-
-        int done = 0;
-        long totalWritten = 0;
-
-        foreach (var file in files)
-        {
-            ct.ThrowIfCancellationRequested();
-            var relPath = Path.GetRelativePath(srcFolder, file);
-            var outPath = Path.Combine(outputFolder, relPath);
-            var outDir = Path.GetDirectoryName(outPath);
-            if (!string.IsNullOrEmpty(outDir) && !Directory.Exists(outDir))
-                Directory.CreateDirectory(outDir);
-
-            var fileSize = new FileInfo(file).Length;
-            if (targetPerFile <= fileSize)
-            {
-                // Just copy if already bigger than target
-                File.Copy(file, outPath, overwrite: true);
-            }
-            else
-            {
-                long padding = targetPerFile - fileSize;
-                var progress = new Progress<(long written, string status)>(p =>
-                {
-                    double filePct = (double)p.written / padding;
-                    double totalPct = ((double)done + filePct) / files.Length;
-                    SetProgress(folderProgressFill, folderProgressTrack, totalPct);
-                    lblFolderStatus.Text = $"[{done + 1}/{files.Length}] {Path.GetFileName(file)} — {FormatSize(p.written)} / {FormatSize(padding)}";
-                    lblFolderStatus.ForeColor = GreenDark;
-                });
-
-                await Task.Run(() => InflateFile(file, outPath, padding, progress, ct), ct);
-
-                totalWritten += padding;
-            }
-            done++;
-        }
-
-        SetProgress(folderProgressFill, folderProgressTrack, 1.0);
-        lblFolderStatus.Text = $"done — {files.Length} files inflated to {FormatSize(targetPerFile)} each";
-        lblFolderStatus.ForeColor = GreenPrimary;
-        System.Media.SystemSounds.Asterisk.Play();
+        finally { SetFolderUIBusy(false); FinishOperation(); }
     }
 
     void SetFolderUIBusy(bool busy)
@@ -1020,478 +993,54 @@ public partial class Form1 : Form
         btnFolderInflate.SetLabel(busy
             ? "CANCEL"
             : (_folderMode == FolderMode.CompressEnlarge ? "COMPRESS & INFLATE" : "INFLATE ALL FILES"));
+        if (_btnBack != null) _btnBack.Enabled = !busy;
         TaskbarProgress.SetState(Handle, busy);
-    }
-
-    // ════════════════════════════════════════════════
-    //  FORMAT ROUTER
-    // ════════════════════════════════════════════════
-
-    static void InflateFile(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        var ext = Path.GetExtension(source).ToLowerInvariant();
-
-        if (ext == ".png")
-            InflatePng(source, output, paddingBytes, progress, ct);
-        else if (ext is ".jpg" or ".jpeg" or ".jfif")
-            InflateJpeg(source, output, paddingBytes, progress, ct);
-        else if (ext is ".mp4" or ".mov" or ".m4v" or ".m4a" or ".3gp" or ".f4v")
-            InflateMp4(source, output, paddingBytes, progress, ct);
-        else if (ext is ".zip" or ".pptx" or ".docx" or ".xlsx" or ".odt" or ".ods" or ".odp"
-                 or ".jar" or ".apk" or ".xpi" or ".epub")
-            InflateZipBased(source, output, paddingBytes, progress, ct);
-        else if (ext == ".pdf")
-            InflatePdf(source, output, paddingBytes, progress, ct);
-        else
-            InflateGeneric(source, output, paddingBytes, progress, ct);
-    }
-
-    // ════════════════════════════════════════════════
-    //  PNG: Hybrid approach.
-    //  Phase 1: paDd chunks before IEND (up to 2.5GB)
-    //           — WIC processes these correctly.
-    //  Phase 2: Raw zeros appended AFTER IEND for the
-    //           rest — WIC stops at IEND, trailing data
-    //           is post-EOF and ignored.
-    //  Image loads fully before hitting any padding.
-    // ════════════════════════════════════════════════
-
-    const long MaxStructuredPadding = 2_500_000_000L; // 2.5GB safe zone for WIC
-
-    static void InflatePng(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        using var src = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
-        using var dst = new FileStream(output, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024);
-
-        long srcLen = src.Length;
-        long structuredBytes = Math.Min(paddingBytes, MaxStructuredPadding);
-        long trailingBytes = paddingBytes - structuredBytes;
-
-        // Copy everything EXCEPT the last 12 bytes (IEND chunk)
-        long copyLen = srcLen - 12;
-        CopyStream(src, dst, copyLen, ct);
-
-        // Phase 1: paDd chunks before IEND (up to 2.5GB)
-        if (structuredBytes > 0)
-        {
-            // Use 16MB chunks — small enough for WIC, large enough for speed
-            const int maxChunkData = 16 * 1024 * 1024; // 16MB per chunk
-            byte[] chunkType = "paDd"u8.ToArray();
-            long remaining = structuredBytes;
-            long totalWritten = 0;
-
-            while (remaining > 0)
-            {
-                ct.ThrowIfCancellationRequested();
-                int chunkDataSize = (int)Math.Min(maxChunkData, remaining);
-
-                WriteBE32(dst, chunkDataSize);
-                dst.Write(chunkType, 0, 4);
-
-                uint crc = Crc32Png.Init();
-                crc = Crc32Png.Update(crc, chunkType);
-
-                byte[] buf = new byte[1024 * 1024];
-                int dataLeft = chunkDataSize;
-                while (dataLeft > 0)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    int toWrite = Math.Min(buf.Length, dataLeft);
-                    crc = Crc32Png.Update(crc, buf.AsSpan(0, toWrite));
-                    dst.Write(buf, 0, toWrite);
-                    dataLeft -= toWrite;
-                    totalWritten += toWrite;
-                    if (totalWritten % (1024 * 1024 * 4) == 0 || dataLeft <= 0)
-                        progress.Report((totalWritten, ""));
-                }
-
-                WriteBE32(dst, (int)Crc32Png.Final(crc));
-                remaining -= chunkDataSize;
-            }
-        }
-
-        // Write original IEND chunk (last 12 bytes)
-        src.Seek(-12, SeekOrigin.End);
-        byte[] iend = new byte[12];
-        src.ReadExactly(iend, 0, 12);
-        dst.Write(iend, 0, 12);
-
-        // Phase 2: Raw zeros after IEND (WIC stops at IEND, ignores trailing)
-        if (trailingBytes > 0)
-        {
-            long alreadyWritten = structuredBytes;
-            var trailProgress = new Progress<(long, string)>(p =>
-                progress.Report((alreadyWritten + p.Item1, "")));
-            WritePaddingRaw(dst, trailingBytes, trailProgress, ct);
-        }
-
-        dst.Flush();
-        progress.Report((paddingBytes, ""));
-    }
-
-    // ════════════════════════════════════════════════
-    //  JPEG: Hybrid approach.
-    //  Phase 1: COM markers before EOI (up to 2.5GB)
-    //           — WIC processes these correctly.
-    //  Phase 2: Raw zeros appended AFTER EOI for the
-    //           rest — WIC stops at EOI, trailing data
-    //           is post-EOF and ignored.
-    //  Image decoded fully BEFORE any padding.
-    //  COM data = 0x20 (space), valid ISO 8859-1.
-    // ════════════════════════════════════════════════
-
-    static void InflateJpeg(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        using var src = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024);
-        using var dst = new FileStream(output, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024);
-
-        long srcLen = src.Length;
-        long structuredBytes = Math.Min(paddingBytes, MaxStructuredPadding);
-        long trailingBytes = paddingBytes - structuredBytes;
-
-        // Copy everything EXCEPT the last 2 bytes (EOI: FF D9)
-        long copyLen = srcLen - 2;
-        CopyStream(src, dst, copyLen, ct);
-
-        // Phase 1: COM markers before EOI (up to 2.5GB)
-        if (structuredBytes > 0)
-        {
-            const int maxComData = 65533;
-            byte[] spaceBuf = new byte[maxComData];
-            Array.Fill(spaceBuf, (byte)0x20);
-            long remaining = structuredBytes;
-            long totalWritten = 0;
-
-            while (remaining > 0)
-            {
-                ct.ThrowIfCancellationRequested();
-                int dataSize = (int)Math.Min(maxComData, remaining);
-                int segLength = dataSize + 2;
-
-                dst.WriteByte(0xFF);
-                dst.WriteByte(0xFE);
-                dst.WriteByte((byte)(segLength >> 8));
-                dst.WriteByte((byte)(segLength & 0xFF));
-                dst.Write(spaceBuf, 0, dataSize);
-
-                remaining -= dataSize;
-                totalWritten += dataSize;
-                if (totalWritten % (maxComData * 64) == 0 || remaining <= 0)
-                    progress.Report((totalWritten, ""));
-            }
-        }
-
-        // Write original EOI (last 2 bytes: FF D9)
-        src.Seek(-2, SeekOrigin.End);
-        byte[] eoi = new byte[2];
-        src.ReadExactly(eoi, 0, 2);
-        dst.Write(eoi, 0, 2);
-
-        // Phase 2: Raw zeros after EOI (WIC stops at EOI, ignores trailing)
-        if (trailingBytes > 0)
-        {
-            long alreadyWritten = structuredBytes;
-            var trailProgress = new Progress<(long, string)>(p =>
-                progress.Report((alreadyWritten + p.Item1, "")));
-            WritePaddingRaw(dst, trailingBytes, trailProgress, ct);
-        }
-
-        dst.Flush();
-        progress.Report((paddingBytes, ""));
-    }
-
-    // Stream copy helper — copies exactly 'count' bytes without loading all into RAM
-    static void CopyStream(Stream src, Stream dst, long count, CancellationToken ct)
-    {
-        byte[] buf = new byte[1024 * 1024];
-        long left = count;
-        while (left > 0)
-        {
-            ct.ThrowIfCancellationRequested();
-            int toRead = (int)Math.Min(buf.Length, left);
-            int read = src.Read(buf, 0, toRead);
-            if (read == 0) break;
-            dst.Write(buf, 0, read);
-            left -= read;
-        }
-    }
-
-    // ════════════════════════════════════════════════
-    //  MP4/MOV: Append a "free" box (ISO 14496-12 standard)
-    //  All MP4 parsers skip free/skip boxes by spec.
-    // ════════════════════════════════════════════════
-
-    static void InflateMp4(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        if (!string.Equals(source, output, StringComparison.OrdinalIgnoreCase))
-            File.Copy(source, output, overwrite: true);
-
-        using var fs = new FileStream(output, FileMode.Open, FileAccess.Write, FileShare.None, 1024 * 1024);
-        fs.Seek(0, SeekOrigin.End);
-
-        long totalBoxSize = paddingBytes + 16; // extended header: 4 + 4 + 8
-
-        // Extended size header (supports >4GB)
-        WriteBE32(fs, 1); // size=1 means "use 64-bit extended size"
-        fs.Write("free"u8.ToArray(), 0, 4);
-        WriteBE64(fs, totalBoxSize);
-
-        // Padding data
-        WritePaddingRaw(fs, paddingBytes, progress, ct);
-    }
-
-    // ════════════════════════════════════════════════
-    //  PDF: Append as a PDF stream object + updated xref
-    //  Keeps PDF structure valid via incremental update.
-    // ════════════════════════════════════════════════
-
-    static void InflatePdf(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        if (!string.Equals(source, output, StringComparison.OrdinalIgnoreCase))
-            File.Copy(source, output, overwrite: true);
-
-        using var fs = new FileStream(output, FileMode.Open, FileAccess.Write, FileShare.None, 1024 * 1024);
-        long startPos = fs.Length;
-        fs.Seek(0, SeekOrigin.End);
-
-        // Write a padding stream object as an incremental update
-        // Use a high object number unlikely to conflict
-        int objNum = 999999;
-        string header = $"\n{objNum} 0 obj\n<< /Length {paddingBytes} >>\nstream\n";
-        string trailer = $"\nendstream\nendobj\n";
-
-        byte[] headerBytes = System.Text.Encoding.ASCII.GetBytes(header);
-        byte[] trailerBytes = System.Text.Encoding.ASCII.GetBytes(trailer);
-
-        fs.Write(headerBytes, 0, headerBytes.Length);
-        WritePaddingRaw(fs, paddingBytes, progress, ct);
-        fs.Write(trailerBytes, 0, trailerBytes.Length);
-
-        // Write a minimal xref + trailer pointing back to original
-        long xrefPos = fs.Position;
-        string xref = $"xref\n0 1\n0000000000 65535 f \n{objNum} 1\n{startPos + 1:D10} 00000 n \ntrailer\n<< /Size {objNum + 1} >>\nstartxref\n{xrefPos}\n%%EOF\n";
-        byte[] xrefBytes = System.Text.Encoding.ASCII.GetBytes(xref);
-        fs.Write(xrefBytes, 0, xrefBytes.Length);
-        fs.Flush();
-    }
-
-    // ════════════════════════════════════════════════
-    //  ZIP-based: Append padding AFTER zip, then relocate
-    //  the EOCD record to the very end. ZIP readers scan
-    //  backward from EOF for the EOCD signature, find it
-    //  at the end, and the central-directory offset inside
-    //  it is still correct (central dir didn't move).
-    //  Result: zero visible entries, completely invisible.
-    // ════════════════════════════════════════════════
-
-    static void InflateZipBased(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        if (!string.Equals(source, output, StringComparison.OrdinalIgnoreCase))
-            File.Copy(source, output, overwrite: true);
-
-        // Read the EOCD from the end of the file
-        byte[] fileBytes;
-        using (var r = new FileStream(output, FileMode.Open, FileAccess.Read, FileShare.Read))
-        {
-            // Read last 64KB to find EOCD (max comment = 65535 + 22 byte EOCD)
-            int tailSize = (int)Math.Min(r.Length, 65557);
-            fileBytes = new byte[tailSize];
-            r.Seek(-tailSize, SeekOrigin.End);
-            r.ReadExactly(fileBytes, 0, tailSize);
-        }
-
-        // Find EOCD signature (0x50 0x4B 0x05 0x06) scanning backward
-        int eocdOffset = -1;
-        for (int i = fileBytes.Length - 22; i >= 0; i--)
-        {
-            if (fileBytes[i] == 0x50 && fileBytes[i + 1] == 0x4B &&
-                fileBytes[i + 2] == 0x05 && fileBytes[i + 3] == 0x06)
-            {
-                eocdOffset = i;
-                break;
-            }
-        }
-
-        if (eocdOffset < 0)
-        {
-            // Fallback: can't find EOCD, use generic append
-            using var fs2 = new FileStream(output, FileMode.Open, FileAccess.Write, FileShare.None, 1024 * 1024);
-            fs2.Seek(0, SeekOrigin.End);
-            WritePaddingRaw(fs2, paddingBytes, progress, ct);
-            return;
-        }
-
-        // Extract the complete EOCD record (22 bytes + comment)
-        int commentLen = fileBytes[eocdOffset + 20] | (fileBytes[eocdOffset + 21] << 8);
-        int eocdTotalLen = 22 + commentLen;
-        byte[] eocdRecord = new byte[eocdTotalLen];
-        Array.Copy(fileBytes, eocdOffset, eocdRecord, 0, eocdTotalLen);
-
-        // Calculate where EOCD starts in the actual file
-        long fileLen;
-        using (var r = new FileStream(output, FileMode.Open, FileAccess.Read)) fileLen = r.Length;
-        long eocdFileOffset = fileLen - (fileBytes.Length - eocdOffset);
-
-        // Truncate file at EOCD position, append padding, then re-append EOCD
-        using var fs = new FileStream(output, FileMode.Open, FileAccess.Write, FileShare.None, 1024 * 1024);
-        fs.SetLength(eocdFileOffset); // chop off the EOCD
-        fs.Seek(0, SeekOrigin.End);
-
-        // Write padding
-        WritePaddingRaw(fs, paddingBytes, progress, ct);
-
-        // Re-append the original EOCD record at the new end
-        fs.Write(eocdRecord, 0, eocdRecord.Length);
-        fs.Flush();
-    }
-
-    // ════════════════════════════════════════════════
-    //  Generic fallback: append zeros after file
-    //  Works for WAV, AU, BMP, GIF, FLAC, ISO, EXE, etc.
-    // ════════════════════════════════════════════════
-
-    static void InflateGeneric(string source, string output, long paddingBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        if (!string.Equals(source, output, StringComparison.OrdinalIgnoreCase))
-            File.Copy(source, output, overwrite: true);
-        using var fs = new FileStream(output, FileMode.Open, FileAccess.Write, FileShare.None, 1024 * 1024);
-        fs.Seek(0, SeekOrigin.End);
-        WritePaddingRaw(fs, paddingBytes, progress, ct);
-    }
-
-    // ════════════════════════════════════════════════
-    //  Raw padding writer
-    // ════════════════════════════════════════════════
-
-    static void WritePaddingRaw(Stream stream, long totalBytes,
-        IProgress<(long, string)> progress, CancellationToken ct)
-    {
-        const int chunkSize = 1024 * 1024;
-        var buffer = new byte[chunkSize]; // zero-filled
-        long written = 0;
-        while (written < totalBytes)
-        {
-            ct.ThrowIfCancellationRequested();
-            int toWrite = (int)Math.Min(chunkSize, totalBytes - written);
-            stream.Write(buffer, 0, toWrite);
-            written += toWrite;
-            if (written % (chunkSize * 4) == 0 || written >= totalBytes)
-                progress.Report((written, ""));
-        }
-        stream.Flush();
-    }
-
-    // ════════════════════════════════════════════════
-    //  Binary helpers
-    // ════════════════════════════════════════════════
-
-    static void WriteBE32(Stream s, int value)
-    {
-        s.WriteByte((byte)(value >> 24));
-        s.WriteByte((byte)(value >> 16));
-        s.WriteByte((byte)(value >> 8));
-        s.WriteByte((byte)value);
-    }
-
-    static void WriteBE64(Stream s, long value)
-    {
-        WriteBE32(s, (int)(value >> 32));
-        WriteBE32(s, (int)value);
     }
 
     // ════════════════════════════════════════════════
     //  HELPERS
     // ════════════════════════════════════════════════
 
-    static long GetTargetBytes(TextBox txt, ComboBox cmb)
-    {
-        if (!double.TryParse(txt.Text, out double val)) val = 1;
-        return cmb.SelectedIndex switch
-        {
-            0 => (long)(val * 1024),
-            1 => (long)(val * 1024 * 1024),
-            2 => (long)(val * 1024 * 1024 * 1024),
-            _ => (long)(val * 1024 * 1024)
-        };
-    }
+    static long GetTargetBytes(TextBox txt, ComboBox cmb) =>
+        Inflator.ParseTargetBytes(txt.Text, cmb.SelectedIndex);
 
     void SetProgress(Panel fill, Panel track, double pct)
     {
+        if (double.IsNaN(pct) || pct < 0) pct = 0;
         fill.Size = new Size((int)(track.Width * Math.Min(1.0, pct)), fill.Height);
-        TaskbarProgress.SetValue(Handle, pct);
+        TaskbarProgress.SetValue(Handle, Math.Min(1.0, pct));
     }
 
     static void ShowMsg(string msg) =>
         MessageBox.Show(msg, "OverByte", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
-    /// Returns true if there's enough space, false if user cancelled or not enough room.
+    static string FormatSize(long bytes) => Inflator.FormatSize(bytes);
+
+    /// Returns true if there's enough space, false if not enough room (the user is told why).
     static bool CheckDiskSpace(string outputPath, long requiredBytes)
     {
-        var root = Path.GetPathRoot(Path.GetFullPath(outputPath));
-        if (string.IsNullOrEmpty(root)) return true;
-        var drive = new DriveInfo(root);
-        if (!drive.IsReady) return true;
-        long free = drive.AvailableFreeSpace;
-        if (free >= requiredBytes) return true;
-
-        ShowMsg(
-            $"Not enough disk space on {drive.Name}\n\n" +
-            $"Required:   {FormatSize(requiredBytes)}\n" +
-            $"Available:  {FormatSize(free)}\n" +
-            $"Short by:   {FormatSize(requiredBytes - free)}\n\n" +
-            $"Free up space or choose a different output location.");
+        var msg = Inflator.CheckDiskSpace(outputPath, requiredBytes);
+        if (msg == null) return true;
+        ShowMsg(msg);
         return false;
-    }
-
-    static string FormatSize(long bytes)
-    {
-        if (bytes < 1024) return $"{bytes} B";
-        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
-        if (bytes < 1024L * 1024 * 1024) return $"{bytes / (1024.0 * 1024):F2} MB";
-        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
     }
 
     // ════════════════════════════════════════════════
     //  HISTORY
     // ════════════════════════════════════════════════
 
-    static List<string> LoadHistory()
-    {
-        try
-        {
-            if (File.Exists(HistoryFile))
-                return File.ReadAllLines(HistoryFile).Where(l => l.Length > 0).Take(MaxHistory).ToList();
-        }
-        catch { }
-        return new();
-    }
+    static List<string> LoadHistory() => History.Load();
 
-    static void SaveToHistory(string path)
-    {
-        try
-        {
-            var dir = Path.GetDirectoryName(HistoryFile);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-            var history = LoadHistory();
-            history.RemoveAll(h => h.Equals(path, StringComparison.OrdinalIgnoreCase));
-            history.Insert(0, path);
-            if (history.Count > MaxHistory) history = history.Take(MaxHistory).ToList();
-            File.WriteAllLines(HistoryFile, history);
-        }
-        catch { }
-    }
+    static void SaveToHistory(string path) => History.Add(path);
+
 
     void RefreshHistoryPanel()
     {
-        historyPanel.Controls.Clear();
+        foreach (Control old in historyPanel.Controls.Cast<Control>().ToArray())
+        {
+            historyPanel.Controls.Remove(old);
+            old.Dispose();
+        }
         var history = LoadHistory();
         if (history.Count == 0) { historyPanel.Visible = false; return; }
 
@@ -1534,12 +1083,7 @@ public partial class Form1 : Form
                 {
                     if (isDir)
                     {
-                        _folderMode = FolderMode.None;
-                        folderModePanel.Visible = true;
-                        folderWorkPanel.Visible = false;
-                        folderStatsPanel.Visible = false;
-                        ShowScreen("folder");
-                        LoadFolder(captured);
+                        OpenFolderScreen(captured);
                     }
                     else
                     {
@@ -1550,8 +1094,10 @@ public partial class Form1 : Form
             }
 
             // Tooltip with full path
-            var tt = new ToolTip();
-            tt.SetToolTip(lbl, path);
+            _historyTip.SetToolTip(lbl, path);
+            lbl.AllowDrop = true;
+            lbl.DragEnter += HandleDragEnter;
+            lbl.DragDrop += HandleDragDrop;
 
             historyPanel.Controls.Add(lbl);
             y += 24;
@@ -1576,6 +1122,8 @@ internal class OBButton : Control
     static readonly Color SecHover = Color.FromArgb(237, 238, 242);
     static readonly Color SecBorder = Color.FromArgb(210, 213, 220);
     static readonly Color SecBorderHover = Color.FromArgb(16, 163, 100);
+    static readonly Font FontPrimary = new("Segoe UI Semibold", 11f);
+    static readonly Font FontSecondary = new("Segoe UI Semibold", 8f);
 
     public OBButton(string label, int x, int y, int w, int h, bool primary = false)
     {
@@ -1594,7 +1142,7 @@ internal class OBButton : Control
         g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
         var rect = new Rectangle(0, 0, Width - 1, Height - 1);
-        var path = RoundRect(rect, 6);
+        using var path = RoundRect(rect, 6);
 
         Color bg, fg, border;
         if (!Enabled) { bg = Color.FromArgb(240, 241, 243); fg = Color.FromArgb(180, 183, 190); border = Color.FromArgb(228, 230, 235); }
@@ -1605,7 +1153,7 @@ internal class OBButton : Control
         using var borderPen = new Pen(border);
         g.FillPath(bgBrush, path); g.DrawPath(borderPen, path);
 
-        var font = _primary ? new Font("Segoe UI Semibold", 11f) : new Font("Segoe UI Semibold", 8f);
+        var font = _primary ? FontPrimary : FontSecondary;
         TextRenderer.DrawText(g, _label, font, ClientRectangle, fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
     }
 
@@ -1621,38 +1169,6 @@ internal class OBButton : Control
     protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); }
     protected override void OnMouseDown(MouseEventArgs e) { _pressed = true; Invalidate(); }
     protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); }
-}
-
-// ══════════════════════════════════════════════════
-//  PNG CRC-32 (standard polynomial 0xEDB88320)
-// ══════════════════════════════════════════════════
-
-internal static class Crc32Png
-{
-    static readonly uint[] Table;
-
-    static Crc32Png()
-    {
-        Table = new uint[256];
-        for (uint i = 0; i < 256; i++)
-        {
-            uint c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            Table[i] = c;
-        }
-    }
-
-    public static uint Init() => 0xFFFFFFFF;
-
-    public static uint Update(uint crc, ReadOnlySpan<byte> data)
-    {
-        foreach (byte b in data)
-            crc = Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
-        return crc;
-    }
-
-    public static uint Final(uint crc) => crc ^ 0xFFFFFFFF;
 }
 
 // ══════════════════════════════════════════════════
