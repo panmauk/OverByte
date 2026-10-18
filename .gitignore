@@ -419,3 +419,6 @@ FodyWeavers.xsd
 
 # OverByte Linux packaging output
 linux/dist/
+
+# Inno Setup compiled installer output
+installer/Output/

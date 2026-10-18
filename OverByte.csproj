@@ -19,6 +19,16 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
+  <!-- Release builds: no debug symbols and deterministic, path-mapped compilation, so the published
+       exe never contains source/PDB paths from the build machine (user names, folders). -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <PathMap>$(MSBuildProjectDirectory)=/src</PathMap>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Include="Form1.cs" />
     <Compile Include="Form1.Designer.cs" />
