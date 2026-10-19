@@ -10,7 +10,10 @@ internal static class FolderInflator
     {
         RecurseSubdirectories = true,
         IgnoreInaccessible = true,
-        AttributesToSkip = 0,          // include hidden/system files like the old Directory.GetFiles did
+        // Include hidden/system files like the old Directory.GetFiles did, but never follow symlinks or
+        // junctions: a junction to a parent folder recursed endlessly, and a link to e.g. the home folder
+        // pulled the whole home folder into the ZIP / output.
+        AttributesToSkip = FileAttributes.ReparsePoint,
         MatchType = MatchType.Simple
     };
 
@@ -143,11 +146,14 @@ internal static class FolderInflator
 
                 var fileSize = sizes[done];
                 int idx = done;
+                // Only files that did not exist before this run may be deleted on cancel/error.
+                // (Previously a same-named file from an earlier run was overwritten and then deleted.)
+                bool existedBefore = File.Exists(outPath);
                 if (targetPerFile <= fileSize)
                 {
                     // Just copy if already bigger than target
+                    if (!existedBefore) createdFiles.Add(outPath);
                     File.Copy(file, outPath, overwrite: true);
-                    createdFiles.Add(outPath);
                 }
                 else
                 {
@@ -155,7 +161,9 @@ internal static class FolderInflator
                     var fileProgress = new SyncProgress<(long written, string status)>(p =>
                         progress.Report((((double)idx + (double)p.written / padding) / files.Length,
                             $"[{idx + 1}/{files.Length}] {Path.GetFileName(file)} — {Inflator.FormatSize(p.written)} / {Inflator.FormatSize(padding)}")));
-                    createdFiles.Add(outPath);
+                    if (!existedBefore) createdFiles.Add(outPath);
+                    // InflateFile writes a temp file and renames it at the end, so a cancel here leaves an
+                    // existing outPath untouched.
                     Inflator.InflateFile(file, outPath, padding, fileProgress, ct);
                 }
                 done++;
@@ -165,7 +173,7 @@ internal static class FolderInflator
         }
         catch
         {
-            // Remove only what this run created — never a pre-existing output folder's other content
+            // Remove only what this run created — never files or folders that existed before it
             foreach (var f in createdFiles) Inflator.TryDelete(f);
             for (int i = createdDirs.Count - 1; i >= 0; i--)
             {

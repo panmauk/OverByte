@@ -195,7 +195,7 @@ public partial class Form1 : Form
             using var pillBrush = new SolidBrush(Color.FromArgb(40, 44, 52));
             using var pillPath = RoundRect(vRect, 10);
             g.FillPath(pillBrush, pillPath);
-            TextRenderer.DrawText(g, "v1.0", FontVersion, vRect, Color.FromArgb(120, 125, 135),
+            TextRenderer.DrawText(g, "v1.0.1", FontVersion, vRect, Color.FromArgb(120, 125, 135),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         };
         Controls.Add(headerPanel);

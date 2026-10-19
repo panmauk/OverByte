@@ -295,7 +295,7 @@ public sealed class MainWindow : Window
             Width = 50, Height = 20, CornerRadius = new CornerRadius(10), Background = Pal.B(Color.FromRgb(40, 44, 52)),
             Child = new TextBlock
             {
-                Text = "v1.0", FontSize = 10, Foreground = Pal.B(Color.FromRgb(120, 125, 135)),
+                Text = "v1.0.1", FontSize = 10, Foreground = Pal.B(Color.FromRgb(120, 125, 135)),
                 HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
             }
         };

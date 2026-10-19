@@ -17,5 +17,5 @@ echo Compiling installer...
 if %ERRORLEVEL% NEQ 0 (echo INSTALLER BUILD FAILED & pause & exit /b 1)
 
 echo.
-echo SUCCESS: installer\Output\OverByte-Setup-1.0.0.exe
+echo SUCCESS: installer\Output\OverByte-Setup-1.0.1.exe
 pause

@@ -14,6 +14,7 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>1.0.1</Version>
     <!-- The Linux (Avalonia) port lives in .\linux and must not be globbed into this project. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);linux\**</DefaultItemExcludes>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>

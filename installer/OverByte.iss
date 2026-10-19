@@ -2,7 +2,7 @@
 ; Build with: installer\build-installer.bat  (or run ISCC.exe on this file after publishing)
 
 #define MyAppName "OverByte"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "Panmox"
 #define MyAppURL "https://github.com/panmauk/OverByte"
 #define MyAppExeName "OverByte.exe"

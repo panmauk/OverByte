@@ -37,7 +37,7 @@ RUNTIME_X64="${RUNTIME_X64:-$HOME/lvtools/runtime-x86_64}"
 RUNTIME_ARM64="${RUNTIME_ARM64:-$HOME/lvtools/runtime-aarch64}"
 
 VERSION="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' "$HERE/OverByte.Linux.csproj" | head -1)"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.0.1}"
 
 MAINTAINER="Panmox <panmauk@users.noreply.github.com>"
 HOMEPAGE="https://panmox.org"
